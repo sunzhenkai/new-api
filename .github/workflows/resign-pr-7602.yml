@@ -1,4 +1,4 @@
-name: resign-pr-7602 (one-off: recreate PR commits with web-flow signature)
+name: resign-pr-7602
 
 on:
   workflow_dispatch: {}
