@@ -17,11 +17,469 @@ jobs:
           ref: 789c970199ea527e6a26e071915f4a4cd2c64178
           fetch-depth: 1
 
-      - name: Apply PR #7602 diff
+      - name: Write patched files
         run: |
-          curl -sfL https://github.com/QuantumNous/new-api/pull/7602.diff -o /tmp/pr.diff
-          git apply --check /tmp/pr.diff
-          git apply /tmp/pr.diff
+          mkdir -p relay/channel/openai relaykit/relayconvert/internal/oai_chat
+          cat > relay/channel/openai/helper.go <<'FILE_ONE'
+package openai
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/logger"
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	relayconstant "github.com/QuantumNous/new-api/relay/constant"
+	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
+
+	"github.com/samber/lo"
+
+	"github.com/gin-gonic/gin"
+)
+
+// 辅助函数
+func HandleStreamFormat(c *gin.Context, info *relaycommon.RelayInfo, data string, forceFormat bool, thinkToContent bool) error {
+	switch info.RelayFormat {
+	case types.RelayFormatOpenAI:
+		info.SendResponseCount++
+		return sendStreamData(c, info, data, forceFormat, thinkToContent)
+	case types.RelayFormatClaude:
+		info.SendResponseCount++
+		return handleClaudeFormat(c, data, info)
+	case types.RelayFormatGemini:
+		// The stateful relaykit path owns its chunk counter so multi-hop and
+		// direct conversions observe the same stream state semantics.
+		return handleGeminiFormat(c, data, info)
+	}
+	return nil
+}
+
+func handleClaudeFormat(c *gin.Context, data string, info *relaycommon.RelayInfo) error {
+	var streamResponse dto.ChatCompletionsStreamResponse
+	if err := common.Unmarshal(common.StringToByteSlice(data), &streamResponse); err != nil {
+		return err
+	}
+
+	if streamResponse.Usage != nil {
+		info.EnsureClaudeConvertInfo().Usage = streamResponse.Usage
+	}
+	result, err := service.ConvertStreamResponse(c, info, types.RelayFormatClaude, &streamResponse)
+	if err != nil {
+		return err
+	}
+	claudeResponses, ok := result.Value.([]*dto.ClaudeResponse)
+	if !ok {
+		return fmt.Errorf("expected Claude stream responses, got %T", result.Value)
+	}
+	for _, resp := range claudeResponses {
+		helper.ClaudeData(c, *resp)
+	}
+	return nil
+}
+
+func handleGeminiFormat(c *gin.Context, data string, info *relaycommon.RelayInfo) error {
+	var streamResponse dto.ChatCompletionsStreamResponse
+	if err := common.Unmarshal(common.StringToByteSlice(data), &streamResponse); err != nil {
+		logger.LogError(c, "failed to unmarshal stream response: "+err.Error())
+		return err
+	}
+
+	state, err := chatToGeminiStreamState(info, &streamResponse)
+	if err != nil {
+		return err
+	}
+	results, err := service.ConvertStreamResponseChunk(c, info, state, &streamResponse)
+	if err != nil {
+		return err
+	}
+	return sendGeminiStreamResults(c, results)
+}
+
+func chatToGeminiStreamState(info *relaycommon.RelayInfo, streamResponse *dto.ChatCompletionsStreamResponse) (*relayconvert.ResponseStreamState, error) {
+	if info != nil && info.ChatToGeminiStreamState != nil {
+		state, ok := info.ChatToGeminiStreamState.(*relayconvert.ResponseStreamState)
+		if !ok || state == nil {
+			return nil, fmt.Errorf("invalid Chat-to-Gemini stream state %T", info.ChatToGeminiStreamState)
+		}
+		return state, nil
+	}
+
+	state, err := relayconvert.NewResponseStreamState(types.RelayFormatOpenAI, types.RelayFormatGemini, relayconvert.ResponseStreamOptions{
+		ID:      streamResponse.Id,
+		Model:   streamResponse.Model,
+		Created: streamResponse.Created,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if info != nil {
+		info.ChatToGeminiStreamState = state
+	}
+	return state, nil
+}
+
+func sendGeminiStreamResults(c *gin.Context, results []relayconvert.ResponseResult) error {
+	for _, result := range results {
+		geminiResponse, ok := result.Value.(*dto.GeminiChatResponse)
+		if !ok {
+			return fmt.Errorf("expected Gemini stream response, got %T", result.Value)
+		}
+		if geminiResponse == nil {
+			continue
+		}
+		data, err := common.Marshal(geminiResponse)
+		if err != nil {
+			logger.LogError(c, "failed to marshal gemini response: "+err.Error())
+			return err
+		}
+		c.Render(-1, common.CustomEvent{Data: "data: " + string(data)})
+		_ = helper.FlushWriter(c)
+	}
+	return nil
+}
+
+func ProcessStreamResponse(streamResponse dto.ChatCompletionsStreamResponse, responseTextBuilder *strings.Builder, toolCount *int) error {
+	for _, choice := range streamResponse.Choices {
+		responseTextBuilder.WriteString(choice.Delta.GetContentString())
+		responseTextBuilder.WriteString(choice.Delta.GetReasoningContent())
+		if choice.Delta.ToolCalls != nil {
+			if len(choice.Delta.ToolCalls) > *toolCount {
+				*toolCount = len(choice.Delta.ToolCalls)
+			}
+			for _, tool := range choice.Delta.ToolCalls {
+				responseTextBuilder.WriteString(tool.Function.Name)
+				responseTextBuilder.WriteString(tool.Function.Arguments)
+			}
+		}
+	}
+	return nil
+}
+
+func processTokenData(info *relaycommon.RelayInfo, data string, responseTextBuilder *strings.Builder, toolCount *int) error {
+	switch info.RelayMode {
+	case relayconstant.RelayModeChatCompletions:
+		var streamResponse dto.ChatCompletionsStreamResponse
+		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+			return err
+		}
+		info.ObserveResponseModel(streamResponse.Model)
+		return ProcessStreamResponse(streamResponse, responseTextBuilder, toolCount)
+	case relayconstant.RelayModeCompletions:
+		var streamResponse dto.CompletionsStreamResponse
+		if err := common.UnmarshalJsonStr(data, &streamResponse); err != nil {
+			return err
+		}
+		processCompletionsStreamResponse(streamResponse, responseTextBuilder)
+	}
+	return nil
+}
+
+func processCompletionsStreamResponse(streamResponse dto.CompletionsStreamResponse, responseTextBuilder *strings.Builder) {
+	for _, choice := range streamResponse.Choices {
+		responseTextBuilder.WriteString(choice.Text)
+	}
+}
+
+func handleLastResponse(lastStreamData string, responseId *string, createAt *int64,
+	systemFingerprint *string, model *string, usage **dto.Usage,
+	containStreamUsage *bool, info *relaycommon.RelayInfo,
+	shouldSendLastResp *bool) error {
+
+	var lastStreamResponse dto.ChatCompletionsStreamResponse
+	if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &lastStreamResponse); err != nil {
+		return err
+	}
+
+	*responseId = lastStreamResponse.Id
+	*createAt = lastStreamResponse.Created
+	*systemFingerprint = lastStreamResponse.GetSystemFingerprint()
+	*model = lastStreamResponse.Model
+
+	if service.ValidUsage(lastStreamResponse.Usage) {
+		*containStreamUsage = true
+		*usage = dto.MergeUsageNonZero(*usage, lastStreamResponse.Usage)
+		if !info.ShouldIncludeUsage {
+			*shouldSendLastResp = lo.SomeBy(lastStreamResponse.Choices, func(choice dto.ChatCompletionsStreamResponseChoice) bool {
+				return choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != ""
+			})
+		}
+	}
+
+	return nil
+}
+
+func HandleFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, lastStreamData string,
+	responseId string, createAt int64, model string, systemFingerprint string,
+	usage *dto.Usage, containStreamUsage bool) {
+
+	switch info.RelayFormat {
+	case types.RelayFormatOpenAI:
+		if info.ShouldIncludeUsage && !containStreamUsage {
+			response := helper.GenerateFinalUsageResponse(responseId, createAt, model, *usage)
+			response.SetSystemFingerprint(systemFingerprint)
+			helper.ObjectData(c, response)
+		}
+		helper.Done(c)
+
+	case types.RelayFormatClaude:
+		var streamResponse dto.ChatCompletionsStreamResponse
+		if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
+			common.SysLog("error unmarshalling stream response: " + err.Error())
+			return
+		}
+
+		info.ClaudeConvertInfo.Usage = usage
+
+		result, err := service.ConvertStreamResponse(c, info, types.RelayFormatClaude, &streamResponse)
+		if err != nil {
+			common.SysLog("error converting Claude stream response: " + err.Error())
+			return
+		}
+		claudeResponses, ok := result.Value.([]*dto.ClaudeResponse)
+		if !ok {
+			common.SysLog(fmt.Sprintf("expected Claude stream responses, got %T", result.Value))
+			return
+		}
+		for _, resp := range claudeResponses {
+			_ = helper.ClaudeData(c, *resp)
+		}
+		if !info.ClaudeConvertInfo.Done {
+			// OpenAI-style upstreams can end without a usable usage frame: the
+			// converter defers the terminal message_delta/message_stop to a
+			// usage frame that never arrives, leaving the Claude stream open
+			// and clients reporting a dropped connection. Emit the terminal
+			// events here so the stream always closes.
+			state, serr := relayconvert.NewResponseStreamState(types.RelayFormatOpenAI, types.RelayFormatClaude, relayconvert.ResponseStreamOptions{})
+			if serr != nil {
+				common.SysLog("error creating Claude finalize state: " + serr.Error())
+			} else if results, ferr := service.FinalizeStreamResponse(c, info, state); ferr != nil {
+				common.SysLog("error finalizing Claude stream response: " + ferr.Error())
+			} else {
+				for _, result := range results {
+					if resp, ok := result.Value.(*dto.ClaudeResponse); ok && resp != nil {
+						_ = helper.ClaudeData(c, *resp)
+					}
+				}
+			}
+		}
+		info.ClaudeConvertInfo.Done = true
+
+	case types.RelayFormatGemini:
+		var streamResponse dto.ChatCompletionsStreamResponse
+		if err := common.Unmarshal(common.StringToByteSlice(lastStreamData), &streamResponse); err != nil {
+			common.SysLog("error unmarshalling stream response: " + err.Error())
+			return
+		}
+
+		state, err := chatToGeminiStreamState(info, &streamResponse)
+		if err != nil {
+			common.SysLog("error creating Gemini stream state: " + err.Error())
+			return
+		}
+		state.SetUsage(usage)
+
+		results, err := service.ConvertStreamResponseChunk(c, info, state, &streamResponse)
+		if err != nil {
+			common.SysLog("error converting final Gemini stream response: " + err.Error())
+			return
+		}
+		if err := sendGeminiStreamResults(c, results); err != nil {
+			common.SysLog("error sending final Gemini stream response: " + err.Error())
+			return
+		}
+
+		results, err = service.FinalizeStreamResponse(c, info, state)
+		if err != nil {
+			common.SysLog("error finalizing Gemini stream response: " + err.Error())
+			return
+		}
+		if err := sendGeminiStreamResults(c, results); err != nil {
+			common.SysLog("error sending finalized Gemini stream response: " + err.Error())
+		}
+	}
+}
+
+func sendResponsesStreamData(c *gin.Context, streamResponse dto.ResponsesStreamResponse, data string) {
+	if data == "" {
+		return
+	}
+	_ = helper.ResponseChunkData(c, streamResponse, data)
+}
+
+FILE_ONE
+          cat > relaykit/relayconvert/internal/oai_chat/to_claude_messages_stream_terminal_test.go <<'FILE_TWO'
+package oaichat
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	// content delta only; no usage yet.
+	terminalChunkText = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`
+	// finish_reason without usage: the converter defers the terminal events.
+	terminalChunkFinishNoUsage = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+	// trailing chunk with non-empty choices, no finish_reason and no usage —
+	// seen on DashScope-style gateways after the finish_reason chunk.
+	terminalChunkTrailingSilent = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{}}]}`
+	// healthy upstream: a final usage-only frame carries real usage.
+	terminalChunkUsageOnlyReal = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}`
+)
+
+func countEventType(types []string, typ string) int {
+	n := 0
+	for _, t := range types {
+		if t == typ {
+			n++
+		}
+	}
+	return n
+}
+
+// convertChunks mirrors the relay loop: every chunk funnels through
+// StreamResponseOpenAI2Claude with one shared info per stream.
+func convertChunks(t *testing.T, chunks []string) (*convmeta.Values, []string) {
+	t.Helper()
+	info := &convmeta.Values{}
+	types := make([]string, 0, len(chunks))
+	for i, raw := range chunks {
+		var resp dto.ChatCompletionsStreamResponse
+		require.NoError(t, json.Unmarshal([]byte(raw), &resp), "chunk %d", i)
+		info.IncrSendResponseCount()
+		for _, r := range StreamResponseOpenAI2Claude(&resp, info) {
+			types = append(types, r.Type)
+		}
+	}
+	return info, types
+}
+
+func TestStreamTerminalEmittedWhenUsageFrameCarriesUsage(t *testing.T) {
+	_, types := convertChunks(t, []string{terminalChunkText, terminalChunkFinishNoUsage, terminalChunkUsageOnlyReal})
+
+	assert.Equal(t, 1, countEventType(types, "message_delta"))
+	assert.Equal(t, 1, countEventType(types, "message_stop"))
+}
+
+func TestStreamStaysOpenWhenFinishChunkIsLastWithoutUsage(t *testing.T) {
+	// finish_reason arrives without usage and the stream ends: the converter
+	// defers the terminal events expecting a usage frame that never comes.
+	info, types := convertChunks(t, []string{terminalChunkText, terminalChunkFinishNoUsage})
+
+	assert.Zero(t, countEventType(types, "message_delta"))
+	assert.Zero(t, countEventType(types, "message_stop"))
+	assert.False(t, info.EnsureClaudeConvertInfo().Done, "stream must not mark itself done without terminal events")
+}
+
+func TestStreamStaysOpenWhenTrailingChunkHasChoicesWithoutFinishReason(t *testing.T) {
+	// DashScope-style gateways send a trailing chunk with non-empty choices,
+	// no finish_reason and no usable usage after the finish_reason chunk. Both
+	// terminal paths are skipped and the state stays open (Done=false).
+	info, types := convertChunks(t, []string{terminalChunkText, terminalChunkFinishNoUsage, terminalChunkTrailingSilent})
+
+	assert.Zero(t, countEventType(types, "message_delta"))
+	assert.Zero(t, countEventType(types, "message_stop"))
+	assert.False(t, info.EnsureClaudeConvertInfo().Done, "stream must not mark itself done without terminal events")
+}
+
+func TestFinalizeClosesStreamAfterDeferredTerminal(t *testing.T) {
+	info, _ := convertChunks(t, []string{terminalChunkText, terminalChunkFinishNoUsage, terminalChunkTrailingSilent})
+	require.False(t, info.EnsureClaudeConvertInfo().Done)
+
+	types := make([]string, 0)
+	for _, r := range FinalizeStreamResponseOpenAI2Claude(info) {
+		types = append(types, r.Type)
+	}
+
+	assert.Equal(t, 1, countEventType(types, "message_delta"))
+	assert.Equal(t, 1, countEventType(types, "message_stop"))
+}
+
+FILE_TWO
+          cat > relay/channel/openai/handler_claude_finalize_test.go <<'FILE_THREE'
+package openai
+
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const (
+	claudeFinalizeChunkText = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"}}]}`
+	// finish_reason without usage: the converter defers the terminal events.
+	claudeFinalizeChunkFinishNoUsage = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+	// trailing chunk with non-empty choices, no finish_reason and no usage —
+	// seen on DashScope-style gateways after the finish_reason chunk.
+	claudeFinalizeChunkTrailingSilent = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{}}]}`
+	// healthy upstream: the finish_reason chunk itself carries usage.
+	claudeFinalizeChunkFinishWithUsage = `{"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":34,"total_tokens":46}}`
+)
+
+func countClaudeEvent(body, event string) int {
+	return strings.Count(body, "event: "+event+"\n")
+}
+
+// Regression: when an OpenAI-chat upstream ends without a usable usage frame,
+// HandleFinalResponse closed the converted Claude stream without the terminal
+// message_delta/message_stop events and clients saw a dropped connection.
+func TestHandleFinalResponseFinalizesOpenAIChatClaudeStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+
+	info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude}
+	info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "m"}
+
+	// Mirror the relay loop: chunks are converted lagging one frame, the last
+	// chunk is handled by HandleFinalResponse.
+	for _, chunk := range []string{claudeFinalizeChunkText, claudeFinalizeChunkFinishNoUsage} {
+		require.NoError(t, HandleStreamFormat(c, info, chunk, false, false))
+	}
+	HandleFinalResponse(c, info, claudeFinalizeChunkTrailingSilent, "c1", 0, "m", "", &dto.Usage{}, false)
+
+	body := w.Body.String()
+	assert.Equal(t, 1, countClaudeEvent(body, "message_delta"), "stream must end with exactly one message_delta:\n%s", body)
+	assert.Equal(t, 1, countClaudeEvent(body, "message_stop"), "stream must end with exactly one message_stop:\n%s", body)
+	assert.True(t, info.ClaudeConvertInfo.Done)
+}
+
+func TestHandleFinalResponseDoesNotDuplicateTerminalEvents(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/v1/messages", nil)
+
+	info := &relaycommon.RelayInfo{RelayFormat: types.RelayFormatClaude}
+	info.ChannelMeta = &relaycommon.ChannelMeta{UpstreamModelName: "m"}
+
+	require.NoError(t, HandleStreamFormat(c, info, claudeFinalizeChunkText, false, false))
+	HandleFinalResponse(c, info, claudeFinalizeChunkFinishWithUsage, "c1", 0, "m", "", &dto.Usage{}, true)
+
+	body := w.Body.String()
+	assert.Equal(t, 1, countClaudeEvent(body, "message_delta"), "healthy streams must not get a second message_delta:\n%s", body)
+	assert.Equal(t, 1, countClaudeEvent(body, "message_stop"), "healthy streams must not get a second message_stop:\n%s", body)
+}
+
+FILE_THREE
 
       - name: Commit and push to PR branch
         run: |
@@ -29,6 +487,6 @@ jobs:
           git config user.email "zhenkai.sun@qq.com"
           git checkout -B fix/openai-channel-claude-stream-finalize
           git add -A
-          git commit -m "fix(claude): always close OpenAI-channel Claude streams with terminal events" -m "The OpenAI-to-Claude SSE converter defers the terminal message_delta/message_stop until a usage frame arrives. Upstreams whose finish_reason chunk carries no usage and whose trailing chunk has non-empty choices without finish_reason (seen on DashScope-style gateways) never trigger either terminal path, and HandleFinalResponse closed the stream without the terminal events, so Claude clients report a dropped connection. Call the registered finalize fallback through the public relayconvert API when the converted stream did not mark itself done, so the terminal events are always emitted. Healthy streams that already emitted them are untouched. (Commit recreated via Actions with GITHUB_TOKEN so it is signed; replaces unsigned 0b2c611.)"
+          git commit -m "fix(claude): always close OpenAI-channel Claude streams with terminal events" -m "The OpenAI-to-Claude SSE converter defers the terminal message_delta/message_stop until a usage frame arrives. Upstreams whose finish_reason chunk carries no usage and whose trailing chunk has non-empty choices without finish_reason (seen on DashScope-style gateways) never trigger either terminal path, and HandleFinalResponse closed the stream without the terminal events, so Claude clients report a dropped connection. Call the registered finalize fallback through the public relayconvert API when the converted stream did not mark itself done, so the terminal events are always emitted. Healthy streams that already emitted them are untouched. (Commit recreated via Actions with GITHUB_TOKEN so it is signed.)"
           git remote add fork https://github.com/sunzhenkai/new-api.git
           git push --force fork fix/openai-channel-claude-stream-finalize
