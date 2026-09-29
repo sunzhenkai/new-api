@@ -1,0 +1,34 @@
+name: resign-pr-7602 (one-off: recreate PR commits with web-flow signature)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream base commit
+        uses: actions/checkout@v4
+        with:
+          repository: QuantumNous/new-api
+          ref: 789c970199ea527e6a26e071915f4a4cd2c64178
+          fetch-depth: 1
+
+      - name: Apply PR #7602 diff
+        run: |
+          curl -sfL https://github.com/QuantumNous/new-api/pull/7602.diff -o /tmp/pr.diff
+          git apply --check /tmp/pr.diff
+          git apply /tmp/pr.diff
+
+      - name: Commit and push to PR branch
+        run: |
+          git config user.name  "zhenkai.sun"
+          git config user.email "zhenkai.sun@qq.com"
+          git checkout -B fix/openai-channel-claude-stream-finalize
+          git add -A
+          git commit -m "fix(claude): always close OpenAI-channel Claude streams with terminal events" -m "The OpenAI-to-Claude SSE converter defers the terminal message_delta/message_stop until a usage frame arrives. Upstreams whose finish_reason chunk carries no usage and whose trailing chunk has non-empty choices without finish_reason (seen on DashScope-style gateways) never trigger either terminal path, and HandleFinalResponse closed the stream without the terminal events, so Claude clients report a dropped connection. Call the registered finalize fallback through the public relayconvert API when the converted stream did not mark itself done, so the terminal events are always emitted. Healthy streams that already emitted them are untouched. (Commit recreated via Actions with GITHUB_TOKEN so it is signed; replaces unsigned 0b2c611.)"
+          git remote add fork https://github.com/sunzhenkai/new-api.git
+          git push --force fork fix/openai-channel-claude-stream-finalize
